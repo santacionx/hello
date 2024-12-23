@@ -1,0 +1,88 @@
+func serviceLevelAccruedBurstDataHelper2(ctx context.Context, s accruedBurstService, accruedBursts InvoicedHistoricalAccruedBurst, subscription cg.SubscriptionBase, slsMap map[string]map[string]float64) ([]cg.ServiceLevelAccruedBurst, error) {
+    result := make([]cg.ServiceLevelAccruedBurst, 0)
+
+    for serviceLevel, accruedBurst := range accruedBursts {
+        var historicalAccruedBurst cg.HistoricalAccruedBursts
+        rawCapacityUsage := make([]cg.HistoricalUsage, 0)
+
+        for _, epochAccruedBurst := range accruedBurst {
+            var totalAccruedBurst float64
+            orderedTimestamp := sortInvoicedHistoricalBurst(epochAccruedBurst)
+            var data DailyUsageData
+
+            for _, epoch := range orderedTimestamp {
+                data = epochAccruedBurst[epoch]
+                totalAccruedBurst += data.DailyValue
+            }
+
+            if data.Status != constants.BURST_INVOICE_PROCESSED {
+                totalAccruedBurst = constants.DATA_UNAVAILABLE
+            }
+
+            serviceEndDate, errEnd := time.Parse(time.RFC3339, data.ServiceEndDate)
+            serviceStartDate, errStart := time.Parse(time.RFC3339, data.ServiceStartDate)
+            if errEnd != nil || errStart != nil {
+                return nil, fmt.Errorf("invalid service dates for service level %s", serviceLevel)
+            }
+
+            if serviceEndDate.After(constants.HISTORICAL_ACCRUED_BURST_START_DATE_UTC) {
+                slCapacityUsage, err := s.FooterClient.GetCapacityUsage(ctx, subscription.SubscriptionNumber, serviceLevel, serviceStartDate, serviceEndDate, constants.DefaultStep)
+                if err != nil {
+                    return nil, err
+                }
+                rawCapacityUsage = slCapacityUsage
+            }
+
+            invoicedHistoricalUsage := make([]cg.InvoicedHistoricalUsage, 0)
+            for _, usage := range rawCapacityUsage {
+                usageDate, err := time.Parse(time.RFC3339, usage.Timestamp)
+                if err != nil {
+                    return nil, err
+                }
+
+                usageDateStr := usageDate.Format("2006-01-02")
+                dailyUsageData, exists := epochAccruedBurst[usageDateStr]
+                if !exists {
+                    continue
+                }
+
+                invoicedHistoricalUsage = append(invoicedHistoricalUsage, cg.InvoicedHistoricalUsage{
+                    Timestamp:              usage.Timestamp,
+                    CommittedBytes:         usage.CommittedBytes,
+                    ConsumedBytes:          usage.ConsumedBytes,
+                    DailyAccruedBurstBytes: dailyUsageData.DailyValue,
+                })
+            }
+
+            usage := cg.HistoricalAccruedBurst{
+                AccruedBurstBytes:       totalAccruedBurst,
+                TimestampUtc:            serviceEndDate.UTC().Format("2006-01-02T15:04:05Z"),
+                Status:                  data.Status,
+                IsBurstInvoiceProcessed: isBurstInvoiceProcessed(data.Status),
+                SubscriptionNumber:      &data.SubscriptionNumber,
+                IsSubscriptionRenewed:   &data.IsSubscriptionRenewed,
+                BillingPeriod:           &cg.BillingPeriod(data.BillingPeriod),
+                BillingEndDate:          &serviceEndDate,
+                BillingStartDate:        &serviceStartDate,
+                InvoiceNumber:           data.InvoiceNumber,
+                InvoicedHistoricalUsage: &invoicedHistoricalUsage,
+            }
+
+            historicalAccruedBurst = append(historicalAccruedBurst, usage)
+        }
+
+        sort.Slice(historicalAccruedBurst, func(i, j int) bool {
+            return helpers.StringToTime(historicalAccruedBurst[i].TimestampUtc).Before(helpers.StringToTime(historicalAccruedBurst[j].TimestampUtc))
+        })
+
+        if helpers.ListContains(subscription.ServiceLevels, serviceLevel) {
+            result = append(result, cg.ServiceLevelAccruedBurst{
+                ServiceLevel:                cg.ServiceLevelName(serviceLevel),
+                HistoricalAccruedBurstBytes: historicalAccruedBurst,
+                IsZeroCommitServiceLevel:    validateZeroCommitServiceLevel(slsMap[subscription.SubscriptionNumber][serviceLevel]),
+            })
+        }
+    }
+
+    return result, nil
+}
